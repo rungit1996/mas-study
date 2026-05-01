@@ -35,13 +35,17 @@ async def main_async():
         make_coffee_async("顾客B"),
         make_coffee_async("顾客C"),
     ]
+
+    # 在一个async函数内部，通过await asyncio.gather()可以并发执行若干个async函数。
     results = await asyncio.gather(*tasks)
     print("所有咖啡都准备好了：", results)
 
     end_time = time.time()
-    print(f"异步方式总耗时：{end_time - start_time}")
+    print(f"异步方式总耗时：{end_time - start_time: .2f}秒")
 
 
 if __name__ == "__main__":
     # main_sync()
+
+    # asyncio提供了完善的异步IO支持，用asyncio.run()调度一个coroutine
     asyncio.run(main_async())
