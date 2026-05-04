@@ -1,12 +1,19 @@
+import asyncio
 import json
+import logging
 import os
+from contextlib import AsyncExitStack
+from typing import Optional
 
 import dotenv
-import requests
-from openai import OpenAI
+from mcp import ClientSession, StdioServerParameters, stdio_client
+from openai import AsyncOpenAI
 from openai.types.chat.chat_completion_chunk import ChoiceDeltaToolCall
 
 dotenv.load_dotenv()
+
+# 关闭 MCP 服务器的多余 INFO 日志
+logging.getLogger("mcp").setLevel(logging.WARNING)
 
 # 定义高德 MCP 基础服务地址
 GAODE_URL = f"https://mcp.amap.com/mcp?key={os.getenv('GAODE_KEY')}"
@@ -16,63 +23,54 @@ SYSTEM_PROMPT = "你是一个强大的聊天机器人，请根据用户的提问
 
 class ReActAgent:
     def __init__(self):
-        self.client = OpenAI()
+        """构造函数，完成 ReActAgent 的初始化，涵盖客户端、生命周期、MCP 会话"""
+        self.client = AsyncOpenAI()
+        self.session: Optional[ClientSession] = None
+        self.exit_stack = AsyncExitStack()
         self.messages = [{"role": "system", "content": SYSTEM_PROMPT}]
         self.model = "deepseek-chat"
         self.tools = []
-        self.headers = {
-            "Accept": "application/json, text/event-stream",
-            "Content-Type": "application/json"
-        }
-        self.init_gaode_mcp()
 
-    def init_gaode_mcp(self) -> None:
-        """初始化高德 MCP 服务"""
-        # 1. 调用高德 MCP 服务获取工具列表信息
-        tools_list_response = requests.post(GAODE_URL, headers=self.headers, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/list",
-            "params": {}
-        })
-        tools_list_response.raise_for_status()
-        tools_list_data = tools_list_response.json()
+    async def init_mcp(self) -> None:
+        """连接到 MCP 服务器"""
+        # 1. 构建 stdio 本地连接参数信息
+        server_params = StdioServerParameters(
+            command="uv",
+            args=[
+                "--directory",
+                "/Users/ysz/YS/Code/demo/mas/mas-study",
+                "run",
+                "mcp-server-demo.py"
+            ],
+            env=None
+        )
 
-        # 2. 组装可用工具列表信息
+        # 2. 启用标准输入输出客户端
+        stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
+        stdio, write = stdio_transport
+        self.session = await self.exit_stack.enter_async_context(ClientSession(stdio, write))
+        # 3. 初始化 MCP 服务器连接
+        await self.session.initialize()
+        # 4. 获取工具列表信息
+        list_tools_response = await self.session.list_tools()
+        tools = list_tools_response.tools
+        print("工具列表：", [tool.name for tool in tools])
         self.tools = [{
             "type": "function",
             "function": {
-                "name": tool["name"],
-                "description": tool["description"],
-                "parameters": tool["inputSchema"]
+                "name": tool.name,
+                "description": tool.description,
+                "parameters": tool.inputSchema,
             }
-        } for tool in tools_list_data["result"]["tools"]]
+        } for tool in tools]
 
-    def call_gaode_mcp(self, name: str, arguments: dict) -> str:
-        """调用高德 MCP 服务"""
-        # 1. 发起请求调用高德 MCP 服务
-        tools_call_response = requests.post(GAODE_URL, headers=self.headers, json={
-            "jsonrpc": "2.0",
-            "id": 1,
-            "method": "tools/call",
-            "params": {
-                "name": name,
-                "arguments": arguments
-            }
-        })
-        tools_call_response.raise_for_status()
-        tools_call_data = tools_call_response.json()
-
-        # 2. 返回响应内容
-        return tools_call_data["result"]["content"][0]["text"]
-
-    def process_query(self, query: str = "") -> None:
+    async def process_query(self, query: str = "") -> None:
         # 将用户传递的数据添加到消息列表中
         if query != "":
             self.messages.append({"role": "user", "content": query})
         print("Assistant: ", end="", flush=True)
 
-        response = self.client.chat.completions.create(
+        response = await self.client.chat.completions.create(
             model=self.model,
             messages=self.messages,
             tools=self.tools,
@@ -84,7 +82,7 @@ class ReActAgent:
         content = ""
         tool_calls_obj: dict[str, ChoiceDeltaToolCall] = {}
 
-        for chunk in response:
+        async for chunk in response:
             # 叠加内容和工具调用
             chunk_content = chunk.choices[0].delta.content
             chunk_tool_calls = chunk.choices[0].delta.tool_calls
@@ -127,7 +125,8 @@ class ReActAgent:
 
                 # 调用工具
                 try:
-                    result = self.call_gaode_mcp(tool_name, tool_arguments)
+                    result = await self.session.call_tool(tool_name, tool_arguments)
+                    result = result.content[0].text
                 except Exception as e:
                     result = f"工具执行出错，Error：{str(e)}"
 
@@ -142,21 +141,38 @@ class ReActAgent:
                 })
 
             # 再次调用模型，让它基于工具调用的结果生成最终回复结果
-            self.process_query()
+            await self.process_query()
 
         print("\n")
 
-    def chat_loop(self):
+    async def chat_loop(self):
         """运行循环对话"""
         while True:
             try:
                 query = input("Query: ").strip()
                 if query.lower() == "quit":
                     break
-                self.process_query(query)
+                await self.process_query(query)
             except Exception as e:
                 print(f"\nError: {str(e)}")
 
+    async def cleanup(self):
+        """清除 Agent 资源"""
+        await self.exit_stack.aclose()
+
+
+async def main():
+    # 1. 创建 ReAct 智能体
+    agent = ReActAgent()
+
+    try:
+        # 2. 初始化 MCP 服务并开启聊天
+        await agent.init_mcp()
+        await agent.chat_loop()
+    finally:
+        # 3. 清空 Agent 资源
+        await agent.cleanup()
+
 
 if __name__ == "__main__":
-    ReActAgent().chat_loop()
+    asyncio.run(main())
