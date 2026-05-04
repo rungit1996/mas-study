@@ -8,3 +8,11 @@ wheels/
 
 # Virtual environments
 .venv
+
+# pycharm
+.idea/
+*.iml
+
+# DS_Store
+.DS_Store
+**/.DS_Store
